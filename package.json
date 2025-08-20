@@ -1,0 +1,9 @@
+{
+    "name": "myquest-collector",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+      "collect": "node collect_exam.js"
+    }
+  }
+  
