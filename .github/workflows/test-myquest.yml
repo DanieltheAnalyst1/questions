@@ -1,0 +1,27 @@
+name: MyQuest docs test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run docs test and save logs
+        env:
+          MYQUEST_KEY: ${{ secrets.MYQUEST_KEY }}
+        run: |
+          node test_myquest.js > myquest_test_output.json 2>&1 || true
+          # upload the raw JSON/log file as artifact
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myquest-test-output
+          path: myquest_test_output.json
