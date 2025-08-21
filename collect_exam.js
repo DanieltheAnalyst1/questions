@@ -1,4 +1,4 @@
-// collect_exam.js
+// collect_exam.js - subject normalization + slug extraction
 // Node 18+ required
 import fs from "fs";
 import path from "path";
@@ -76,14 +76,15 @@ function writeOutputs(allItems, perSubjectMap) {
     else if (s.includes(",") || s.includes("\n")) s = `"${s}"`;
     return s;
   };
-  const header = ["source_id","exam","source_year","source_subject","question","options","answer","explanation","fetched_page"];
+  const header = ["source_id","exam","source_year","source_subject_label","source_subject_slug","question","options","answer","explanation","fetched_page"];
   const lines = [header.join(",")];
   for (const q of allItems) {
     lines.push([
       safe(q.id ?? ""),
       safe(q._source_exam ?? EXAM),
       safe(q._source_year ?? ""),
-      safe(q._source_subject ?? ""),
+      safe(q._source_subject_label ?? q._source_subject ?? ""),
+      safe(q._source_subject_slug ?? ""),
       safe(q.question_text ?? q.question ?? ""),
       safe(q.options ? JSON.stringify(q.options) : ""),
       safe(q.correct_answer ?? q.answer ?? ""),
@@ -114,6 +115,67 @@ function loadCheckpoint() {
   try { return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, "utf8")); } catch (e) { console.warn("Could not parse checkpoint file, ignoring it.", e.message); return null; }
 }
 
+// Return { label, slug } normalized from a subject entry returned by the API
+function normalizeSubjectEntry(entry) {
+  // entry may be string or object. Try to extract a slug field if present.
+  if (typeof entry === "string") {
+    const label = entry;
+    // derive a likely slug candidate from label
+    const slugCandidates = [
+      label,
+      label.toLowerCase(),
+      label.replace(/\s+/g,"-").toLowerCase(),
+      label.replace(/\s+/g,"_").toLowerCase(),
+      label.replace(/[^\w\s-]/g,"").toLowerCase(),
+      label.replace(/[\s\._]+/g,"-").toLowerCase()
+    ];
+    return { label, slugCandidates: Array.from(new Set(slugCandidates)) };
+  }
+  // entry is object, try common field names
+  const label = entry.name ?? entry.title ?? entry.label ?? entry.subject ?? entry.text ?? JSON.stringify(entry);
+  // find slug/key fields
+  const slugFields = ["slug","key","subject","value","id","code"];
+  const slugCandidates = [];
+  for (const f of slugFields) {
+    if (entry[f]) slugCandidates.push(String(entry[f]));
+  }
+  // also derived from label
+  slugCandidates.push(label, label.toLowerCase(), label.replace(/\s+/g,"-").toLowerCase(), label.replace(/\s+/g,"_").toLowerCase());
+  return { label, slugCandidates: Array.from(new Set(slugCandidates.filter(Boolean))) };
+}
+
+// Try slug candidates then fall back to variants, return first non-empty questions
+async function trySubjectSlugCandidates(exam, year, slugCandidates, page) {
+  for (const sVar of slugCandidates) {
+    try {
+      const r = await postQuestions({ exam, exam_year_id: String(year), subject: sVar, page });
+      const qs = (r && (r.data?.questions ?? r.questions ?? r.data ?? r)) || [];
+      if (Array.isArray(qs) && qs.length > 0) return { qs, usedVariant: sVar };
+    } catch (e) {
+      const msg = String(e.message || "");
+      if (msg.includes("404") || msg.toLowerCase().includes("not found")) continue;
+      console.warn(`Error trying candidate "${sVar}" for ${exam}/${year} p${page}:`, msg);
+    }
+    await sleep(60);
+  }
+
+  // fallbacks: try additional generated forms
+  const fallbacks = [];
+  for (const sVar of slugCandidates) {
+    fallbacks.push(sVar.replace(/\s+/g,"-"), sVar.replace(/\s+/g,"_"), sVar.toLowerCase(), sVar.replace(/[^\w\s-]/g,""));
+  }
+  for (const sVar of Array.from(new Set(fallbacks)).filter(Boolean)) {
+    try {
+      const r = await postQuestions({ exam, exam_year_id: String(year), subject: sVar, page });
+      const qs = (r && (r.data?.questions ?? r.questions ?? r.data ?? r)) || [];
+      if (Array.isArray(qs) && qs.length > 0) return { qs, usedVariant: sVar };
+    } catch (e) { /* ignore */ }
+    await sleep(60);
+  }
+
+  return { qs: [], usedVariant: null };
+}
+
 async function discoverExams() {
   try {
     const r = await postWithGet("exam", {});
@@ -140,54 +202,20 @@ async function discoverSubjectsForYear(year) {
   try {
     const r = await postWithGet("subject", { exam: EXAM, exam_year_id: String(year) });
     const arr = (r && (r.data ?? r.subjects ?? r)) || [];
-    return Array.isArray(arr) ? arr : [];
+    // arr items may be strings or objects, normalize them to { label, slugCandidates }
+    if (!Array.isArray(arr)) return [];
+    return arr.map(normalizeSubjectEntry);
   } catch (err) {
-    // log quietly and return empty array
     console.warn(`discoverSubjectsForYear(${year}) error:`, err.message);
     return [];
   }
 }
 
-// Try several subject slug variants and return the first non-empty result
-async function trySubjectVariants(exam, year, subject, page) {
-  const variants = [];
-  const raw = String(subject);
-  variants.push(raw); // as-is
-  variants.push(raw.toLowerCase());
-  variants.push(raw.replace(/\s+/g,"-").toLowerCase());
-  variants.push(raw.replace(/\s+/g,"_").toLowerCase());
-  variants.push(raw.replace(/[^\w\s-]/g,"").toLowerCase()); // remove punctuation
-  variants.push(raw.replace(/[\s\._]+/g,"-").toLowerCase());
-  // unique
-  const uniq = Array.from(new Set(variants));
-  for (const sVar of uniq) {
-    try {
-      const r = await postQuestions({ exam, exam_year_id: String(year), subject: sVar, page });
-      const qs = (r && (r.data?.questions ?? r.questions ?? r.data ?? r)) || [];
-      if (Array.isArray(qs) && qs.length > 0) {
-        if (sVar !== raw) console.log(`Subject variant matched: "${raw}" -> "${sVar}" for year ${year} page ${page}`);
-        return { qs, usedVariant: sVar };
-      }
-    } catch (e) {
-      // if it returns 404 or not found, skip quietly
-      const msg = String(e.message || "");
-      if (msg.includes("404") || msg.toLowerCase().includes("not found")) continue;
-      // otherwise log and continue trying variants
-      console.warn(`Error trying variant "${sVar}" for ${exam}/${year}/${raw} p${page}:`, msg);
-    }
-    // polite delay between variant attempts to avoid rate limits
-    await sleep(80);
-  }
-  return { qs: [], usedVariant: null };
-}
-
-async function fetchQuestionsFor(exam, year, subject, page = 1) {
-  // uses variant trial internally
+async function fetchQuestionsFor(exam, year, subjectSlugCandidates, page = 1) {
   try {
-    const { qs, usedVariant } = await trySubjectVariants(exam, year, subject, page);
-    return { questions: qs, usedVariant };
+    return await trySubjectSlugCandidates(exam, year, subjectSlugCandidates, page);
   } catch (err) {
-    console.warn(`fetchQuestions ${exam} ${year} ${subject} p${page} error`, err.message);
+    console.warn(`fetchQuestions ${exam} ${year} p${page} error`, err.message);
     return { questions: [], usedVariant: null };
   }
 }
@@ -195,7 +223,6 @@ async function fetchQuestionsFor(exam, year, subject, page = 1) {
 async function main() {
   console.log(`Starting collection for ${EXAM}, PER_SUBJECT_TARGET ${PER_SUBJECT_TARGET ?? "not set"}, TARGET ${TARGET ?? "not set"}`);
 
-  // verify exam exists
   const exams = await discoverExams();
   console.log("Available exams from API:", exams.join(", "));
   if (!exams.includes(EXAM)) {
@@ -208,7 +235,7 @@ async function main() {
   let collectedMap = {};
   if (checkpoint?.items && Array.isArray(checkpoint.items)) {
     for (const q of checkpoint.items) {
-      const key = norm(q._source_subject ? `${q._source_subject}::${q.question_text ?? q.question ?? ""}` : (q.question_text ?? q.question ?? ""));
+      const key = norm(q._source_subject_slug ? `${q._source_subject_slug}::${q.question_text ?? q.question ?? ""}` : (q.question_text ?? q.question ?? ""));
       collectedMap[key] = q;
     }
     console.log("Loaded", Object.keys(collectedMap).length, "items from checkpoint");
@@ -224,26 +251,41 @@ async function main() {
       console.log("Discovered years:", state.years.join(", "));
     }
 
-    const subjSet = new Set();
+    const subjMap = new Map();
     for (const y of state.years) {
-      const subs = await discoverSubjectsForYear(y);
-      if (Array.isArray(subs) && subs.length) subs.forEach(s => subjSet.add(String(s)));
+      const discovered = await discoverSubjectsForYear(y);
+      // discovered is array of { label, slugCandidates }
+      for (const item of discovered) {
+        // use label as map key to avoid duplicates
+        const label = item.label ?? (item.slugCandidates && item.slugCandidates[0]) ?? "unknown";
+        if (!subjMap.has(label)) subjMap.set(label, item.slugCandidates);
+      }
       await sleep(POLITE_DELAY_MS);
     }
-    state.subjects = Array.from(subjSet).sort();
+
+    state.subjects = Array.from(subjMap.entries()).map(([label, slugCandidates]) => ({ label, slugCandidates }));
     if (!state.subjects.length) {
-      console.warn("No subjects discovered, using fallback subjects list");
-      state.subjects = ["mathematics","english","physics","chemistry","biology"];
-    } else console.log("Discovered subjects (sample):", state.subjects.slice(0,20).join(", "));
+      console.warn("No subjects discovered, using fallback list");
+      state.subjects = [
+        { label: "mathematics", slugCandidates: ["mathematics","mathematics","math"] },
+        { label: "english", slugCandidates: ["english","use-of-english","use_of_english"] },
+        { label: "physics", slugCandidates: ["physics"] },
+        { label: "chemistry", slugCandidates: ["chemistry"] },
+        { label: "biology", slugCandidates: ["biology"] }
+      ];
+    } else {
+      console.log("Discovered subjects (sample):", state.subjects.slice(0,20).map(s => s.label).join(", "));
+    }
+
     state.ptr = {};
-    for (const s of state.subjects) state.ptr[s] = { yearIndex: 0, page: 1, collected: 0, exhausted: false };
+    for (const s of state.subjects) state.ptr[s.label] = { yearIndex: 0, page: 1, collected: 0, exhausted: false, slugCandidates: s.slugCandidates };
     saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched: 0 });
     console.log("Initial checkpoint saved");
   } else {
     state.years = Array.isArray(state.years) ? state.years : [];
     state.subjects = Array.isArray(state.subjects) ? state.subjects : [];
     state.ptr = state.ptr ?? {};
-    for (const s of state.subjects) state.ptr[s] = state.ptr[s] ?? { yearIndex: 0, page: 1, collected: 0, exhausted: false };
+    for (const s of state.subjects) state.ptr[s.label] = state.ptr[s.label] ?? { yearIndex: 0, page: 1, collected: 0, exhausted: false, slugCandidates: s.slugCandidates ?? [] };
     console.log("Resuming from checkpoint, subjects:", state.subjects.length, "years:", state.years.length);
   }
 
@@ -263,8 +305,9 @@ async function main() {
     let progress = false;
     console.log(`Round ${round}, total collected ${Object.keys(collectedMap).length}`);
 
-    for (const subject of subjects) {
-      const p = state.ptr[subject];
+    for (const subjectObj of subjects) {
+      const subjectLabel = subjectObj.label;
+      const p = state.ptr[subjectLabel];
       if (!p || p.exhausted) continue;
       if ((p.collected || 0) >= perSubTarget) continue;
 
@@ -272,11 +315,14 @@ async function main() {
         if ((p.yearIndex || 0) >= state.years.length) { p.exhausted = true; break; }
         const year = state.years[p.yearIndex];
         const page = p.page || 1;
-        const { questions: qs, usedVariant } = await fetchQuestionsFor(EXAM, year, subject, page);
+        const slugCandidates = p.slugCandidates ?? subjectObj.slugCandidates ?? [subjectLabel];
+        const { qs, usedVariant } = await (async () => {
+          const res = await trySubjectSlugCandidates(EXAM, year, slugCandidates, page);
+          return { qs: res.qs, usedVariant: res.usedVariant };
+        })();
         pagesFetched += 1;
 
         if (!Array.isArray(qs) || qs.length === 0) {
-          // try next year
           p.yearIndex = (p.yearIndex || 0) + 1;
           p.page = 1;
           await sleep(POLITE_DELAY_MS);
@@ -285,15 +331,15 @@ async function main() {
 
         progress = true;
         for (const q of qs) {
-          const key = norm(`${subject}::${q.question_text ?? q.question ?? ""}`);
+          const key = norm(`${usedVariant || subjectLabel}::${q.question_text ?? q.question ?? ""}`);
           if (!collectedMap[key]) {
             const annotated = {
               ...q,
               _source_exam: EXAM,
               _source_year: String(year),
-              _source_subject: subject,
-              _fetched_page: page,
-              _subject_variant_used: usedVariant ?? subject
+              _source_subject_label: subjectLabel,
+              _source_subject_slug: usedVariant ?? (p.slugCandidates && p.slugCandidates[0]) ?? subjectLabel,
+              _fetched_page: page
             };
             collectedMap[key] = annotated;
             p.collected = (p.collected || 0) + 1;
@@ -308,7 +354,7 @@ async function main() {
           saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched });
           console.log("Checkpoint saved at pagesFetched =", pagesFetched);
         }
-      } // end per-subject while
+      } // end subject while
     } // end subjects for
 
     saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched });
@@ -316,8 +362,7 @@ async function main() {
       console.log("No new questions found this round, stopping.");
       break;
     }
-
-    const allReached = subjects.every(s => (state.ptr[s]?.collected || 0) >= perSubTarget || state.ptr[s]?.exhausted);
+    const allReached = subjects.every(s => (state.ptr[s.label]?.collected || 0) >= perSubTarget || state.ptr[s.label]?.exhausted);
     if (allReached) {
       console.log("All subjects reached per-subject target or exhausted.");
       break;
@@ -326,9 +371,9 @@ async function main() {
 
   const all = Object.values(collectedMap);
   const perSubjectMap = {};
-  for (const s of subjects) perSubjectMap[s] = [];
+  for (const s of subjects) perSubjectMap[s.label] = [];
   for (const q of all) {
-    const subj = q._source_subject ?? "unknown";
+    const subj = q._source_subject_label ?? "unknown";
     if (!perSubjectMap[subj]) perSubjectMap[subj] = [];
     perSubjectMap[subj].push(q);
   }
