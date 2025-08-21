@@ -1,5 +1,5 @@
 // collect_exam.js
-// Node 18+ required (will run in GitHub Actions)
+// Node 18+ required
 import fs from "fs";
 import path from "path";
 
@@ -11,7 +11,13 @@ if (!KEY) {
 }
 
 const EXAM = (process.env.EXAM || "JAMB").toString();
-const TARGET = process.env.TARGET ? parseInt(process.env.TARGET, 10) : 10000;
+const PER_SUBJECT_TARGET = process.env.PER_SUBJECT_TARGET ? parseInt(process.env.PER_SUBJECT_TARGET, 10) : null;
+const TARGET = process.env.TARGET ? parseInt(process.env.TARGET, 10) : null;
+if (!PER_SUBJECT_TARGET && !TARGET) {
+  console.error("Set either PER_SUBJECT_TARGET or TARGET (total). For 1000 per subject set PER_SUBJECT_TARGET=1000");
+  process.exit(1);
+}
+
 const POLITE_DELAY_MS = process.env.POLITE_DELAY_MS ? parseInt(process.env.POLITE_DELAY_MS, 10) : 120;
 const CHECKPOINT_PAGES = process.env.CHECKPOINT_PAGES ? parseInt(process.env.CHECKPOINT_PAGES, 10) : 40;
 
@@ -32,10 +38,8 @@ async function postWithGet(getQuery, body = {}) {
   });
   const text = await res.text();
   let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch(e) { json = { rawText: text }; }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${text}`);
-  }
+  try { json = text ? JSON.parse(text) : null; } catch (e) { json = { rawText: text }; }
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${text}`);
   return json;
 }
 
@@ -47,10 +51,8 @@ async function postQuestions(body = {}) {
   });
   const text = await res.text();
   let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch(e) { json = { rawText: text }; }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${text}`);
-  }
+  try { json = text ? JSON.parse(text) : null; } catch (e) { json = { rawText: text }; }
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${text}`);
   return json;
 }
 
@@ -59,11 +61,10 @@ function norm(s = "") {
 }
 
 function saveCheckpoint(obj) {
-  try { fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(obj, null, 2), "utf8"); }
-  catch (e) { console.warn("Checkpoint write failed", e.message); }
+  try { fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(obj, null, 2), "utf8"); } catch (e) { console.warn("Checkpoint write failed", e.message); }
 }
 
-function writeOutputs(allItems) {
+function writeOutputs(allItems, perSubjectMap) {
   const examFile = path.join(OUT_DIR, `exam_${EXAM}.json`);
   fs.writeFileSync(examFile, JSON.stringify(allItems, null, 2), "utf8");
 
@@ -75,33 +76,42 @@ function writeOutputs(allItems) {
     else if (s.includes(",") || s.includes("\n")) s = `"${s}"`;
     return s;
   };
-  const header = ["source_id","exam","exam_year_id","subject","question","options","answer","explanation"];
+  const header = ["source_id","exam","source_year","source_subject","question","options","answer","explanation","fetched_page"];
   const lines = [header.join(",")];
   for (const q of allItems) {
     lines.push([
       safe(q.id ?? ""),
-      safe(q.exam ?? EXAM),
-      safe(q.exam_year_id ?? ""),
-      safe(q.subject ?? ""),
+      safe(q._source_exam ?? EXAM),
+      safe(q._source_year ?? ""),
+      safe(q._source_subject ?? ""),
       safe(q.question_text ?? q.question ?? ""),
       safe(q.options ? JSON.stringify(q.options) : ""),
       safe(q.correct_answer ?? q.answer ?? ""),
-      safe(q.explanation ?? "")
+      safe(q.explanation ?? ""),
+      safe(q._fetched_page ?? "")
     ].join(","));
   }
   fs.writeFileSync(csvFile, lines.join("\n"), "utf8");
   console.log(`Wrote ${examFile} (${allItems.length}) and ${csvFile}`);
+
+  // write per-subject files
+  for (const s of Object.keys(perSubjectMap)) {
+    const filename = path.join(SUBJECTS_DIR, `${s.replace(/[^a-z0-9_\\-]/gi, "_")}.json`);
+    fs.writeFileSync(filename, JSON.stringify(perSubjectMap[s], null, 2), "utf8");
+  }
+  // write summary
+  const summary = {
+    exam: EXAM,
+    total_collected: allItems.length,
+    subjects: Object.fromEntries(Object.keys(perSubjectMap).map(k => [k, perSubjectMap[k].length]))
+  };
+  fs.writeFileSync(path.join(OUT_DIR, `summary_${EXAM}.json`), JSON.stringify(summary, null, 2), "utf8");
+  console.log("Wrote per-subject files and summary");
 }
 
 function loadCheckpoint() {
   if (!fs.existsSync(CHECKPOINT_FILE)) return null;
-  try {
-    const raw = fs.readFileSync(CHECKPOINT_FILE, "utf8");
-    return JSON.parse(raw);
-  } catch (e) {
-    console.warn("Could not parse checkpoint file, ignoring it.", e.message);
-    return null;
-  }
+  try { return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, "utf8")); } catch (e) { console.warn("Could not parse checkpoint file, ignoring it.", e.message); return null; }
 }
 
 async function discoverYears() {
@@ -132,22 +142,20 @@ async function fetchQuestionsFor(exam, year, subject, page = 1) {
     return (r && (r.data?.questions ?? r.questions ?? r.data ?? r)) || [];
   } catch (err) {
     const msg = String(err.message || "");
-    if (msg.includes("404") || msg.toLowerCase().includes("not found") || msg.includes("Subject")) {
-      return [];
-    }
+    if (msg.includes("404") || msg.toLowerCase().includes("not found") || msg.includes("Subject")) return [];
     console.warn(`fetchQuestions ${exam} ${year} ${subject} p${page} error`, err.message);
     return [];
   }
 }
 
 async function main() {
-  console.log(`Starting collection for ${EXAM} target ${TARGET}`);
+  console.log(`Starting collection for ${EXAM}, per-subject target ${PER_SUBJECT_TARGET ?? "not set"}, TARGET ${TARGET ?? "not set"}`);
   const checkpoint = loadCheckpoint();
   let state = checkpoint?.state ?? null;
   let collectedMap = {};
   if (checkpoint?.items && Array.isArray(checkpoint.items)) {
     for (const q of checkpoint.items) {
-      const key = norm(q.question_text ?? q.question ?? "");
+      const key = norm(q._source_subject ? `${q._source_subject}::${q.question_text ?? q.question ?? ""}` : (q.question_text ?? q.question ?? ""));
       collectedMap[key] = q;
     }
     console.log("Loaded", Object.keys(collectedMap).length, "items from checkpoint");
@@ -159,9 +167,7 @@ async function main() {
     if (!state.years.length) {
       console.warn("No years discovered, falling back to 2024..2000 for discovery");
       state.years = ["2024","2023","2022","2021","2020","2019","2018","2017","2016","2015","2014","2013","2012","2011","2010","2009","2008","2007","2006","2005","2004","2003","2002","2001","2000"];
-    } else {
-      console.log("Discovered years:", state.years.join(", "));
-    }
+    } else console.log("Discovered years:", state.years.join(", "));
 
     const subjSet = new Set();
     for (const y of state.years) {
@@ -171,12 +177,9 @@ async function main() {
     }
     state.subjects = Array.from(subjSet).sort();
     if (!state.subjects.length) {
-      console.warn("No subjects discovered from API, using fallback subjects list");
+      console.warn("No subjects discovered, using fallback subjects list");
       state.subjects = ["mathematics","english","physics","chemistry","biology"];
-    } else {
-      console.log("Discovered subjects (sample):", state.subjects.slice(0,10).join(", "));
-    }
-
+    } else console.log("Discovered subjects (sample):", state.subjects.slice(0,10).join(", "));
     state.ptr = {};
     for (const s of state.subjects) state.ptr[s] = { yearIndex: 0, page: 1, collected: 0, exhausted: false };
     saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched: 0 });
@@ -195,25 +198,22 @@ async function main() {
     return;
   }
 
-  const perSubjectBase = Math.ceil(TARGET / subjects.length);
-  console.log("Subjects count:", subjects.length, "per-subject base target:", perSubjectBase);
+  const perSubTarget = PER_SUBJECT_TARGET ?? (TARGET ? Math.ceil(TARGET / subjects.length) : Math.ceil(10000 / subjects.length));
+  console.log("Subjects count:", subjects.length, "per-subject target:", perSubTarget);
 
   let pagesFetched = checkpoint?.pagesFetched ?? 0;
   let round = 0;
-  while (Object.keys(collectedMap).length < TARGET) {
+  while (true) {
     round += 1;
     let progress = false;
-    console.log(`Round ${round}, total collected ${Object.keys(collectedMap).length}/${TARGET}`);
+    console.log(`Round ${round}, total collected ${Object.keys(collectedMap).length}`);
 
     for (const subject of subjects) {
-      if (Object.keys(collectedMap).length >= TARGET) break;
       const p = state.ptr[subject];
       if (!p || p.exhausted) continue;
+      if ((p.collected || 0) >= perSubTarget) continue;
 
-      const subjectTarget = Math.max(perSubjectBase, Math.ceil((TARGET - Object.keys(collectedMap).length) / subjects.length));
-      if ((p.collected || 0) >= subjectTarget) continue;
-
-      while ((p.collected || 0) < subjectTarget && Object.keys(collectedMap).length < TARGET && !p.exhausted) {
+      while ((p.collected || 0) < perSubTarget && !p.exhausted) {
         if ((p.yearIndex || 0) >= state.years.length) { p.exhausted = true; break; }
         const year = state.years[p.yearIndex];
         const page = p.page || 1;
@@ -229,13 +229,20 @@ async function main() {
 
         progress = true;
         for (const q of qs) {
-          const key = norm(q.question_text ?? q.question ?? "");
+          const key = norm(`${subject}::${q.question_text ?? q.question ?? ""}`);
           if (!collectedMap[key]) {
-            collectedMap[key] = q;
+            // annotate with source metadata
+            const annotated = {
+              ...q,
+              _source_exam: EXAM,
+              _source_year: String(year),
+              _source_subject: subject,
+              _fetched_page: page
+            };
+            collectedMap[key] = annotated;
             p.collected = (p.collected || 0) + 1;
           }
-          if (p.collected >= subjectTarget) break;
-          if (Object.keys(collectedMap).length >= TARGET) break;
+          if (p.collected >= perSubTarget) break;
         }
 
         p.page = (p.page || 1) + 1;
@@ -245,31 +252,35 @@ async function main() {
           saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched });
           console.log("Checkpoint saved at pagesFetched =", pagesFetched);
         }
-      }
-    }
+      } // end per-subject while
+    } // end subjects for
 
     saveCheckpoint({ state, items: Object.values(collectedMap), pagesFetched });
+    // stop when no subject made progress this round
     if (!progress) {
-      console.log("No new questions found this round, stopping. Collected:", Object.keys(collectedMap).length);
+      console.log("No new questions found this round, stopping.");
       break;
     }
-  }
+
+    // stop if all subjects reached per-subject target
+    const allReached = subjects.every(s => (state.ptr[s]?.collected || 0) >= perSubTarget || state.ptr[s]?.exhausted);
+    if (allReached) {
+      console.log("All subjects reached per-subject target or exhausted.");
+      break;
+    }
+  } // end main while
 
   const all = Object.values(collectedMap);
+  // per-subject grouping
   const perSubjectMap = {};
   for (const s of subjects) perSubjectMap[s] = [];
   for (const q of all) {
-    const subj = q.subject ?? "unknown";
+    const subj = q._source_subject ?? "unknown";
     if (!perSubjectMap[subj]) perSubjectMap[subj] = [];
     perSubjectMap[subj].push(q);
   }
-  for (const s of Object.keys(perSubjectMap)) {
-    if (!perSubjectMap[s].length) continue;
-    const filename = path.join(SUBJECTS_DIR, `${s.replace(/[^a-z0-9_\\-]/gi, "_")}.json`);
-    fs.writeFileSync(filename, JSON.stringify(perSubjectMap[s], null, 2), "utf8");
-  }
 
-  writeOutputs(all);
+  writeOutputs(all, perSubjectMap);
   saveCheckpoint({ state: { done: true, totalCollected: all.length }, items: all });
   console.log("Finished. Collected", all.length, "unique questions for", EXAM);
 }

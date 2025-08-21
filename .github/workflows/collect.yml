@@ -3,10 +3,10 @@ name: Collect MyQuest Questions
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Target questions per exam'
+      per_subject_target:
+        description: 'Per subject target questions (e.g. 1000)'
         required: false
-        default: '10000'
+        default: '1000'
 
 jobs:
   collect:
@@ -23,16 +23,17 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund || true
+      - name: Skip install (no dependencies required)
+        run: node -v
 
       - name: Run collector for ${{ matrix.exam }}
         env:
           MYQUEST_KEY: ${{ secrets.MYQUEST_KEY }}
-          TARGET: ${{ github.event.inputs.target || '10000' }}
+          PER_SUBJECT_TARGET: ${{ github.event.inputs.per_subject_target || '1000' }}
           EXAM: ${{ matrix.exam }}
+          POLITE_DELAY_MS: '150'
         run: |
-          echo "Running collector for $EXAM target $TARGET"
+          echo "Running collector for $EXAM per-subject target $PER_SUBJECT_TARGET"
           node collect_exam.js
 
       - name: Upload outputs artifact
