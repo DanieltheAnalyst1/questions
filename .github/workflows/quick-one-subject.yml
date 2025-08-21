@@ -1,0 +1,20 @@
+name: Quick One Subject Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  quick-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node quick_one_subject_test.js > quick_one_subject_output.json 2>&1 || true
+        env:
+          MYQUEST_KEY: ${{ secrets.MYQUEST_KEY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quick-one-subject-output
+          path: quick_one_subject_output.json
