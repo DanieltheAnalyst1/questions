@@ -8,9 +8,9 @@ async function fetchQuestions() {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      exam: "JAMB",
+      exam: "POSTUTME",
       exam_year_id: "2024",
-      subject: "Government" // exact case-sensitive name
+      subject: "Mathematics" // exact case-sensitive name
     })
   });
 
